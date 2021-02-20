@@ -18,6 +18,8 @@
 
 #include <linux/ioctl.h>
 #include <linux/dvb/ca.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include "SocketHandler.h"
 #include "Log.h"
 
@@ -85,8 +87,13 @@ void SocketHandler::OpenConnection()
 
   freeaddrinfo(servinfo); // all done with this structure
 
-  if (sock)
-    DEBUGLOG("created socket with socket_fd=%d", sock);
+  if (sock == 0)
+    return;
+
+  int val = 1;
+  setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (int*)&val, sizeof(val));
+
+  DEBUGLOG("created socket with socket_fd=%d", sock);
 }
 
 void SocketHandler::CloseConnection()
@@ -102,17 +109,29 @@ void SocketHandler::CloseConnection()
 void SocketHandler::Write(unsigned char *data, int len)
 {
   DEBUGLOG("%s, sock=%d", __FUNCTION__, sock);
-  if (sock > 0)
+  if (sock == 0)
+    return;
+
+  if (!WriteData(data, len, 500))
+    CloseConnection();
+}
+
+bool SocketHandler::Read(unsigned char *data, int len)
+{
+  DEBUGLOG("%s, sock=%d", __FUNCTION__, sock);
+  if (sock < 0)
+    return false;
+
+  int rc = ReadData(data, len, 1000);
+
+  if (rc == ECONNRESET)
   {
-    int wrote = write(sock, data, len);
-    DEBUGLOG("socket_fd=%d len=%d wrote=%d", sock, len, wrote);
-    if (wrote != len)
-    {
-      ERRORLOG("%s: wrote != len", __FUNCTION__);
-      close(sock);
-      sock = 0;
-    }
+    ERRORLOG("%s: connection reset", __FUNCTION__);
+    CloseConnection();
+    return false;
   }
+
+  return (rc == 0);
 }
 
 void SocketHandler::SendFilterData(unsigned char demux_id, unsigned char filter_num, unsigned char *data, int len)
@@ -163,100 +182,94 @@ void SocketHandler::Action(void)
 {
   DEBUGLOG("%s", __FUNCTION__);
   unsigned char buff[262];
-  int cRead;
   uint32_t *request;
   uint8_t adapter_index;
-  int faults = 0;
-  int skip_bytes = 0;
 
   while (Running())
   {
     if (sock == 0 && capmt && !capmt->Empty())
     {
-      if (faults == 0 || (faults > 0 && checkTimer.TimedOut()))
+      DEBUGLOG("OSCam not connected, (re)connecting...");
+      OpenConnection();
+      if (sock > 0)
       {
-        DEBUGLOG("OSCam not connected, (re)connecting...");
-        OpenConnection();
-        if (sock > 0)
-        {
-          DEBUGLOG("Successfully (re)connected to OSCam");
-          faults = 0;
-          SendClientInfo();
-          capmt->SendAll();
-        }
-        else
-          faults++;
-        checkTimer.Set(SOCKET_CHECK_INTERVAL);
+        DEBUGLOG("Successfully (re)connected to OSCam");
+        SendClientInfo();
+        capmt->SendAll();
       }
+    }
+
+    if (sock == 0)
+    {
       cCondWait::SleepMs(20);
       continue;
     }
 
     // request
-    cRead = recv(sock, &buff[skip_bytes], sizeof(int)-skip_bytes, MSG_DONTWAIT);
-    if (cRead <= 0)
+    int status = ReadData(buff, sizeof(int), 100);
+
+    if (status == ECONNRESET)
     {
-      if (cRead == 0)
-        CloseConnection();
-      cCondWait::SleepMs(20);
+      CloseConnection();
       continue;
     }
+
+    if (status == ETIMEDOUT || status != 0)
+    {
+      continue;
+    }
+
     request = (uint32_t *) &buff;
-    skip_bytes = 0;
 
     if (ntohl(*request) != DVBAPI_SERVER_INFO)
     {
       // first byte -> adapter_index
-      cRead = recv(sock, &adapter_index, 1, MSG_DONTWAIT);
-      if (cRead <= 0)
-      {
-        if (cRead == 0)
-          CloseConnection();
-        cCondWait::SleepMs(20);
+      if (!Read(&adapter_index, 1)) {
         continue;
       }
       adapter_index -= AdapterIndexOffset;
     }
 
+    bool rc = true;
+
     *request = ntohl(*request);
     if (*request == CA_SET_PID)
-      cRead = recv(sock, buff+4, sizeof(ca_pid_t), MSG_DONTWAIT);
+      rc = Read(buff+4, sizeof(ca_pid_t));
     else if (*request == CA_SET_DESCR)
-      cRead = recv(sock, buff+4, sizeof(ca_descr_t), MSG_DONTWAIT);
+      rc = Read(buff+4, sizeof(ca_descr_t));
     else if (*request == CA_SET_DESCR_AES)
-      cRead = recv(sock, buff+4, sizeof(ca_descr_aes_t), MSG_DONTWAIT);
+      rc = Read(buff+4, sizeof(ca_descr_aes_t));
     else if (*request == CA_SET_DESCR_MODE)
-      cRead = recv(sock, buff+4, sizeof(ca_descr_mode_t), MSG_DONTWAIT);
+      rc = Read(buff+4, sizeof(ca_descr_mode_t));
     else if (*request == CA_SET_DESCR_DATA)
-      cRead = recv(sock, buff+4, sizeof(ca_descr_data_t), MSG_DONTWAIT);
+      rc = Read(buff+4, sizeof(ca_descr_data_t));
     else if (*request == DMX_SET_FILTER)
-      cRead = recv(sock, buff+4, sizeof(struct dmx_sct_filter_params), MSG_DONTWAIT);
+      rc = Read(buff+4, sizeof(struct dmx_sct_filter_params));
     else if (*request == DMX_STOP)
-      cRead = recv(sock, buff+4, 2 + 2, MSG_DONTWAIT);
+      rc = Read(buff+4, 2 + 2);
     else if (*request == DVBAPI_SERVER_INFO)
     {
       unsigned char len;
-      recv(sock, buff+4, 2, MSG_DONTWAIT);             //proto version
-      recv(sock, &len, 1, MSG_DONTWAIT);               //string length
-      cRead = recv(sock, buff+6, len, MSG_DONTWAIT);
+      rc &= Read(buff+4, 2);             //proto version
+      rc &= Read(&len, 1);               //string length
+      rc &= Read(buff+6, len);
       buff[6+len] = 0;                                 //terminate the string
     }
     else if (*request == DVBAPI_ECM_INFO)
-      recv(sock, buff+4, 14, MSG_DONTWAIT);            //read ECM info const len header only
+      rc = Read(buff+4, 14);            //read ECM info const len header only
     else
     {
       ERRORLOG("%s: read failed unknown command: %08x", __FUNCTION__, *request);
+      CloseConnection(); // no chance to recover in this case -> reconnect
+      continue;
+    }
+
+    if (!rc)
+    {
       cCondWait::SleepMs(20);
       continue;
     }
 
-    if (cRead <= 0)
-    {
-      if (cRead == 0)
-        CloseConnection();
-      cCondWait::SleepMs(20);
-      continue;
-    }
     if (*request == CA_SET_PID)
     {
       DEBUGLOG("%s: Got CA_SET_PID request, adapter_index=%d", __FUNCTION__, adapter_index);
@@ -304,11 +317,15 @@ void SocketHandler::Action(void)
 
       //We have a size of CA_SET_DESCR_DATA message > size of ca_descr_data_t because the ca_descr_data.data is a pointer
       //Size of CA_SET_DESCR_DATA message is a 16 + ca_descr_data.length, see Oscam module-dvbapi.c
-      recv(sock, data + (16 + ca_descr_data.length - sizeof(ca_descr_data_t)), ca_descr_data.length - (16 + ca_descr_data.length - sizeof(ca_descr_data_t)), MSG_DONTWAIT);
-      ca_descr_data.data = data;
-      decsa->SetAes(ca_descr_aes.index, false);
-      decsa->SetData(&ca_descr_data, false);
-      DEBUGLOG("%s: Got CA_SET_DESCR_DATA request, adapter_index=%d, index=%x", __FUNCTION__, adapter_index, ca_descr_data.index);
+      rc = Read(data + (16 + ca_descr_data.length - sizeof(ca_descr_data_t)), ca_descr_data.length - (16 + ca_descr_data.length - sizeof(ca_descr_data_t)));
+
+      if(rc)
+      {
+        DEBUGLOG("%s: Got CA_SET_DESCR_DATA request, adapter_index=%d, index=%x", __FUNCTION__, adapter_index, ca_descr_data.index);
+        ca_descr_data.data = data;
+        decsa->SetAes(ca_descr_aes.index, false);
+        decsa->SetData(&ca_descr_data, false);
+      }
     }
     else if (*request == DMX_SET_FILTER)
     {
@@ -383,31 +400,104 @@ void SocketHandler::Action(void)
       uint32_t ecmtime = ntohl(*ecmtime_ptr);
 
       //cardsystem name
-      recv(sock, &len, 1, MSG_DONTWAIT);               //string length
-      recv(sock, cardsystem, len, MSG_DONTWAIT);
+      rc &= Read(&len, 1);                             //string length
+      rc &= Read((unsigned char*)cardsystem, len);
       cardsystem[len] = 0;                             //terminate the string
 
       //reader name
-      recv(sock, &len, 1, MSG_DONTWAIT);               //string length
-      recv(sock, reader, len, MSG_DONTWAIT);
+      rc &= Read(&len, 1);                             //string length
+      rc &= Read((unsigned char*)reader, len);
       reader[len] = 0;                                 //terminate the string
 
       //source (from)
-      recv(sock, &len, 1, MSG_DONTWAIT);               //string length
-      recv(sock, from, len, MSG_DONTWAIT);
+      rc &= Read(&len, 1);                             //string length
+      rc &= Read((unsigned char*)from, len);
       from[len] = 0;                                   //terminate the string
 
       //protocol name
-      recv(sock, &len, 1, MSG_DONTWAIT);               //string length
-      recv(sock, protocol, len, MSG_DONTWAIT);
+      rc &= Read(&len, 1);                             //string length
+      rc &= Read((unsigned char*)protocol, len);
       protocol[len] = 0;                               //terminate the string
 
-      recv(sock, &hops, 1, MSG_DONTWAIT);              //hops
+      rc &= Read(&hops, 1);                            //hops
 
       DEBUGLOG("%s: Got ECM_INFO: adapter_index=%d, SID = %04X, CAID = %04X (%s), PID = %04X, ProvID = %06X, ECM time = %d ms, reader = %s, from = %s, protocol = %s, hops = %d", __FUNCTION__, adapter_index, sid, caid, cardsystem, pid, prid, ecmtime, reader, from, protocol, hops);
-      capmt->UpdateEcmInfo(adapter_index, sid, caid, pid, prid, ecmtime, cardsystem, reader, from, protocol, hops);
+      if(rc)
+        capmt->UpdateEcmInfo(adapter_index, sid, caid, pid, prid, ecmtime, cardsystem, reader, from, protocol, hops);
     }
     else
       DEBUGLOG("%s: Unknown request: %02X %02X %02X %02X", __FUNCTION__, request[0], request[1], request[2], request[3]);
+
+    if (!rc)
+    {
+      DEBUGLOG("%s: Error reading data - resetting connection", __FUNCTION__);
+      CloseConnection();
+    }
   }
+}
+
+bool SocketHandler::pollfd(int timeout_ms, bool in) {
+    struct pollfd p;
+    p.fd = sock;
+    p.events = in ? POLLIN : POLLOUT;
+    p.revents = 0;
+
+    return (::poll(&p, 1, timeout_ms) > 0);
+}
+
+bool SocketHandler::WriteData(unsigned char* data, int len, int timeout_ms) {
+    int written = 0;
+
+    while (written < len)
+    {
+      if (pollfd(timeout_ms, false) == 0)
+        return false;
+
+      int rc = send(sock, (const void*)(data + written), len - written, MSG_DONTWAIT | MSG_NOSIGNAL);
+
+      if (rc == -1 || rc == 0)
+      {
+        if (errno == EAGAIN)
+          continue;
+
+        ERRORLOG("%s: error writing to socket - %i (%s)", __FUNCTION__, errno, strerror(errno));
+        return false;
+      }
+
+      DEBUGLOG("socket_fd=%d len=%d wrote=%d", sock, len, rc);
+      written += rc;
+    }
+
+    return true;
+}
+
+int SocketHandler::ReadData(unsigned char* data, int len, int timeout_ms) {
+    int read = 0;
+
+    while(read < len)
+    {
+      if (pollfd(timeout_ms, true) == 0)
+        return ETIMEDOUT;
+
+      int rc = recv(sock, (char*)(data + read), len - read, MSG_DONTWAIT);
+
+      if (rc == 0)
+        return ECONNRESET;
+
+      if (rc == -1)
+      {
+        if (errno == EAGAIN)
+          continue;
+
+        if (errno == EBADF || errno == ENOTCONN)
+          return ECONNRESET;
+
+        ERRORLOG("%s: error reading from socket - %i (%s)", __FUNCTION__, errno, strerror(errno));
+        return errno;
+      }
+
+      read += rc;
+    }
+
+    return 0;
 }

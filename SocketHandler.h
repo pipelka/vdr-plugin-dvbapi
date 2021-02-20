@@ -73,11 +73,18 @@ public:
   ~SocketHandler();
   void OpenConnection();
   void CloseConnection();
+  bool Read(unsigned char *data, int len);
   void Write(unsigned char *data, int len);
   virtual void Action(void);
   void SendFilterData(unsigned char demux_id, unsigned char filter_num, unsigned char *data, int len);
   void SendClientInfo();
   void SendStopDescrambling();
+
+protected:
+
+  bool WriteData(unsigned char* data, int len, int timeout_ms);
+  int ReadData(unsigned char* data, int len, int timeout_ms);
+  bool pollfd(int timeout_ms, bool in);
 
 private:
   int sock;
